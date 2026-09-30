@@ -25,5 +25,5 @@ data/
 .idea/
 .DS_Store
 
-DATA_SOURCE.md
+DATA_SOURCES.md
 DEVOPS.md
