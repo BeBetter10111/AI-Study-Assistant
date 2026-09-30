@@ -1,0 +1,189 @@
+GHI CHÚ CẬP NHẬT CODE — AI STUDY ASSISTANT
+==========================================
+So sánh với: Project_Y3_Sem1.docx (tài liệu kế hoạch dự án)
+File gốc:    ai-study-assistant.zip
+
+Toàn bộ file trong bản gốc chỉ là khung sườn (scaffold): hầu hết các hàm
+đều "raise NotImplementedError" và vài file có lỗi import/khai báo sai
+khiến app không chạy được dù có cắm đủ hạ tầng (Postgres/Qdrant/MinIO/Redis).
+Bên dưới là danh sách các lỗi thực sự đã sửa và các phần đã cài đặt, đã
+được chạy thử (unit test tay + gọi thử API qua httpx với DB SQLite giả lập,
+mock các thư viện AI nặng như torch/vllm/outlines/qdrant-client/
+sentence-transformers) để xác nhận không còn lỗi biên trước khi đóng gói.
+
+
+1) LỖI THỰC SỰ ĐàSỬA (không phải TODO, mà là bug khiến code sai/crash)
+------------------------------------------------------------------
+- backend-ai/app/models/models.py
+  Import `String`, `Integer`, `Column` từ `tokenize`, `traitlets`, `pypika`
+  — đây không phải là các lớp ORM, hoàn toàn sai. Đã viết lại bằng
+  SQLAlchemy đúng chuẩn, dùng UUID làm khóa chính để khớp với
+  scripts/init_db.sql (bản cũ dùng Integer, lệch hoàn toàn với SQL thật).
+  QuizAttempt cũng được khớp lại đúng các cột trong init_db.sql
+  (is_correct, response_time_s, hints_used) thay vì (quiz_id, score) như
+  bản cũ — đồng thời bổ sung cột quiz_id còn thiếu trong cả 2 phía.
+
+- backend-ai/app/core/llm_engine.py, backend-ai/app/rag/vector_store.py
+  Dùng getattr(settings, "LLM_MODEL_NAME", ...), getattr(settings,
+  "QDRANT_URL", ...) — sai tên field (Settings dùng chữ thường:
+  llm_model_name, qdrant_url), nên getattr luôn "miss" và âm thầm dùng
+  giá trị mặc định, bỏ qua hoàn toàn cấu hình thật trong .env /
+  docker-compose. Đã sửa để đọc đúng field; đã bổ sung field
+  gpu_memory_utilization còn thiếu hẳn trong Settings.
+
+- backend-ai/app/rl/agent.py
+  update_state() gọi thẳng update_state_in_db(...) — một hàm CHƯA TỪNG
+  được định nghĩa ở đâu trong code base. Endpoint nộp bài quiz sẽ luôn
+  crash với NameError. Đã thay bằng cơ chế lưu trạng thái độ khó theo
+  user (đã test: làm đúng liên tiếp → độ khó tăng dần lên "hard", làm
+  sai liên tiếp → giảm dần về "easy").
+
+- backend-ai/app/worker/tasks.py
+  ingestion.extract_text(file_path, ...) được gọi trực tiếp với
+  storage_path (khóa object trong MinIO, ví dụ "abc-123.pdf"), trong khi
+  ingestion.py dùng fitz.open()/docx.Document()/Presentation() — tất cả
+  đều cần đường dẫn file THẬT trên ổ đĩa. Với thiết kế cũ, mọi tài liệu
+  upload lên sẽ crash ngay khi worker xử lý. Đã sửa: worker tải file từ
+  MinIO về file tạm trước, xử lý xong thì xoá file tạm, đồng thời cập
+  nhật đúng trạng thái Document (pending → chunking → embedded/failed).
+
+- backend-ai/app/api/dependencies.py
+  get_current_user so sánh trực tiếp chuỗi lấy từ JWT ("sub") với cột
+  User.id kiểu UUID. Khi test thực tế bằng SQLAlchemy async, việc này
+  ném AttributeError ('str' object has no attribute 'hex') tùy theo
+  driver/dialect. Đã sửa: ép kiểu uuid.UUID(...) tường minh và bắt lỗi
+  để trả về 401 sạch sẽ thay vì lộ lỗi 500 khi token có "sub" không hợp lệ.
+
+- backend-ai/requirements.txt
+  * bcrypt (không ghim version) cài mới nhất = 5.0.0, nhưng passlib==1.7.4
+    gọi API nội bộ bcrypt.__about__.__version__ đã bị gỡ ở bcrypt>=4.1
+    → mọi lần hash/verify mật khẩu đều crash ngay ở thao tác đầu tiên.
+    ĐÃ TỰ TEST và tái hiện được lỗi này, sau đó ghim bcrypt==4.0.1 để fix.
+  * Thiếu hẳn: outlines, langchain-text-splitters, tiktoken,
+    email-validator — được code import/sử dụng nhưng chưa khai báo,
+    khiến `pip install -r requirements.txt` xong app vẫn ImportError.
+
+- frontend/src/services/api.js
+  askQuestion()/generateQuiz() gửi JSON body ({question}, {topic,...}),
+  nhưng 2 endpoint chat.py/quiz.py (bản cũ) khai báo tham số kiểu
+  "question: str" trần — FastAPI hiểu đây là query param bắt buộc trên
+  URL, không phải JSON body. Gọi từ frontend luôn nhận lỗi 422. Backend
+  hai endpoint này đã được viết lại dùng Pydantic request model đúng với
+  những gì frontend gửi.
+
+
+2) CÁC PHẦN ĐÃ CÀI ĐẶT TỪ TODO / NotImplementedError
+-----------------------------------------------------
+- auth.py: đăng ký (hash mật khẩu bằng bcrypt qua passlib) + đăng nhập,
+  cấp JWT (python-jose, HS256), cùng thông báo lỗi.
+- dependencies.py: get_current_user giải mã JWT thật, tra User trong DB.
+- documents.py: upload lưu file vào MinIO (tự tạo bucket nếu chưa có),
+  tạo bản ghi Document (status=pending), đẩy task Celery xử lý nền;
+  giới hạn định dạng (.pdf/.docx/.pptx) và dung lượng (50MB); endpoint
+  status trả về trạng thái ingest hiện tại.
+- chat.py: bộ định tuyến ý định đơn giản theo từ khóa (hỏi đáp / tạo
+  quiz / tóm tắt) như tài liệu yêu cầu, hybrid search qua Qdrant, gọi
+  LLM sinh câu trả lời kèm nguồn trích dẫn (Grounded RAG — không trả
+  lời khi không tìm thấy ngữ cảnh phù hợp), theo dõi độ trễ so với
+  ngưỡng 800ms trong tài liệu.
+- quiz.py: sinh quiz bằng Tool Calling (Outlines ép JSON schema), lọc
+  bỏ câu hỏi có correct_index sai biên trước khi trả về; submit chấm
+  điểm, ghi QuizAttempt, gọi RL agent để trả về độ khó câu hỏi tiếp theo.
+- rl/reward.py: công thức reward dựa trên tỷ lệ đúng (trọng số 0.6),
+  tốc độ trả lời (0.3, càng nhanh hơn 30s càng cao), phạt theo số lần
+  dùng gợi ý (0.1, tối đa 5 lượt) — luôn kẹp kết quả trong [0, 1].
+- rl/agent.py: cập nhật trạng thái theo user, quyết định độ khó tiếp
+  theo (easy/medium/hard) dựa trên ngưỡng reward.
+- vector_store.py: khởi tạo Qdrant/embedding model theo kiểu lazy
+  (trì hoãn đến lần dùng đầu tiên) thay vì kết nối ngay lúc import module
+  — tránh app crash khi khởi động nếu Qdrant chưa kịp sẵn sàng (biên đã
+  gặp khi test: main.py trước đây sẽ sập ngay từ import nếu Qdrant chưa
+  lên). Point ID trong Qdrant cũng đổi sang UUID5 tất định từ
+  document_id + chỉ số chunk để idempotent khi worker retry.
+- Frontend: ChatWindow.jsx (hỏi đáp + hiển thị nguồn trích dẫn),
+  QuizPlayer.jsx (làm bài, dùng gợi ý, chấm điểm, gửi kết quả về
+  backend — đúng yêu cầu "help me to implement this" ghi trong file gốc),
+  FlashcardDeck.jsx (lật thẻ, tự đánh giá mức độ nhớ) — cả 3 trước đó
+  chỉ return null.
+
+
+3) ĐÃ KIỂM THỬ NHƯ THẾ NÀO
+---------------------------
+- python -m py_compile toàn bộ file .py trong backend-ai/app — không lỗi
+  cú pháp.
+- Dựng venv nhẹ, cài các gói không cần GPU (fastapi, pydantic,
+  sqlalchemy, python-jose, passlib, bcrypt, minio, celery...), rồi mock
+  các thư viện AI nặng (torch, vllm, outlines, qdrant-client,
+  sentence-transformers, langchain-text-splitters, fitz, docx, pptx) để
+  import được toàn bộ app.main mà không cần GPU/Docker thật.
+- Dùng httpx.AsyncClient gọi trực tiếp app FastAPI (ASGITransport) với
+  DB SQLite trong bộ nhớ: test đăng ký/đăng nhập (kể cả trùng email, sai
+  mật khẩu), upload tài liệu (sai định dạng, thiếu auth, MinIO không kết
+  nối được), tra cứu trạng thái tài liệu (UUID không hợp lệ, không tồn
+  tại), hỏi đáp chatbot (câu hỏi rỗng, không tìm thấy ngữ cảnh), sinh
+  quiz (không có ngữ cảnh), nộp bài quiz (thiếu auth, quiz_id sai định
+  dạng, response_time_s âm) — tất cả đều trả đúng mã lỗi/kết quả mong đợi.
+- Test riêng rl/reward.py và rl/agent.py bằng vòng lặp làm đúng/sai liên
+  tiếp để xác nhận độ khó tăng/giảm đúng hướng và bị kẹp ở 2 đầu
+  ("easy"/"hard").
+
+
+4) CHƯA LÀM (nằm ngoài phạm vi sửa lỗi biên, cần quyết định thêm)
+-------------------------------------------------------------------
+- CORS "allow_origins=[*]" trong main.py vẫn để TODO như bản gốc (ghi
+  chú sẵn), vì cần domain frontend thật khi triển khai production.
+- Trạng thái RL hiện lưu trong bộ nhớ tiến trình (không bền vững khi
+  restart hoặc chạy nhiều instance) — đã ghi rõ TODO trong code để
+  chuyển sang bảng riêng trong Postgres/Redis khi lên production.
+- Zero-downtime thật sự (nhiều replica + load balancer, hoặc Swarm/K8s) —
+  xem giải thích trong DEVOPS.md, phần "Về zero-downtime — nói thật".
+
+
+5) CẬP NHẬT LẦN 2 — CI/CD pipeline + data sourcing guide
+-----------------------------------------------------------
+- .github/workflows/ci.yml: lint + test frontend (npm, cache theo
+  package-lock.json) và backend (ruff + pytest, cache theo
+  requirements-ci.txt) trên mỗi push/PR vào main.
+- .github/workflows/cd.yml: build & push 2 Docker image (backend,
+  frontend) lên GHCR (cache layer qua GitHub Actions cache) → deploy
+  staging tự động → deploy production CHỜ DUYỆT thủ công
+  (environment: production + Required reviewers) → cả 2 môi trường đều
+  chờ container "healthy" rồi mới smoke test, tự rollback về image
+  "previous" nếu smoke test fail.
+- scripts/smoke_test.sh: đã tự dựng server FastAPI thật (mock lib AI
+  nặng) và chạy thử script này qua HTTP thật — pass.
+- app/main.py: /health giờ là readiness check thật (SELECT 1 vào
+  Postgres, trả 503 nếu DB chưa sẵn sàng) thay vì chỉ báo "process còn
+  sống". Lưu ý: bản đầu tiên của chính thay đổi này có bug (đọc nhầm
+  response.status_code mặc định là None chứ không phải 200, khiến DB
+  khỏe mạnh vẫn báo "degraded") — đã tự phát hiện qua test thật và sửa.
+- docker-compose.yml: thêm healthcheck cho mọi service (Postgres, Qdrant,
+  MinIO, Redis, backend, frontend) + depends_on: condition:
+  service_healthy, để service phụ thuộc chỉ khởi động sau khi service
+  kia THẬT SỰ sẵn sàng, không chỉ "đã start container".
+- worker/tasks.py: phát hiện thêm 1 bug thật khi dựng CI — tạo sync
+  DB engine lúc import module cần driver psycopg2, nhưng gói này chưa
+  có trong requirements.txt (chỉ có asyncpg cho driver async) → worker
+  sẽ crash khi xử lý task đầu tiên. Đã sửa thành lazy-init + bổ sung
+  psycopg2-binary vào requirements.txt.
+- Frontend: bổ sung index.html, vite.config.js, src/main.jsx, src/App.jsx
+  (khung ứng dụng ráp đăng nhập/đăng ký, upload tài liệu, 3 tab
+  Chat/Quiz/Flashcard lại với nhau — trước đó chỉ có 3 file feature rời
+  rạc, `npm run build` sẽ luôn fail vì thiếu entry point). Thêm ESLint
+  (eslint.config.js) + script "lint" vào package.json — trước đó
+  package.json không có script lint/test nào cả nên ví dụ CI mẫu người
+  dùng cung cấp sẽ không chạy được nếu áp thẳng vào project này.
+- backend-ai/requirements-ci.txt, pytest.ini, pyproject.toml (cấu hình
+  ruff), tests/conftest.py + tests/test_reward_and_rl.py +
+  tests/test_api_flows.py: bộ test thật (19 test) dùng lại đúng các lỗi
+  biên từng gặp trong quá trình phát triển (đăng ký trùng email, JWT
+  không hợp lệ, upload sai định dạng, document_id không phải UUID,
+  response_time_s âm, không có ngữ cảnh cho quiz...) làm regression
+  test — đã chạy thật trong venv sạch (không cần GPU) và pass toàn bộ.
+- DEVOPS.md: tài liệu giải thích pipeline, health check, smoke test,
+  rollback, approval gate, và đặc biệt là giới hạn thật của
+  zero-downtime với docker-compose (không tô hồng).
+- DATA_SOURCES.md: gợi ý nguồn dữ liệu mở (CC-BY/CC-BY-NC-SA) khớp với
+  từng môn trong coursework của bạn (AI, DSA, Database, OOAD/OOP,
+  Computer Architecture) + khung tính "bao nhiêu data là đủ" dựa theo
+  đúng cấu hình chunk_size=512/overlap=50 hiện có trong chunking.py.
