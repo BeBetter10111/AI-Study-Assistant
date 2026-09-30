@@ -25,5 +25,7 @@ data/
 .idea/
 .DS_Store
 
+
 DATA_SOURCES.md
 DEVOPS.md
+CHANGES.txt
